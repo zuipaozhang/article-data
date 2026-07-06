@@ -109,14 +109,80 @@ def update_record(token: str, record_id: str, fields: dict) -> bool:
 
 # ========== 微信文章采集 ==========
 
-def fetch_article(url: str) -> dict:
-    """采集单篇文章，返回字段数据"""
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _get_rendered_html(url: str) -> str | None:
+    """用 Playwright 渲染页面，拿到包含阅读量/在看数的完整 HTML"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.warning("Playwright 未安装，回退到 requests 模式")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ])
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale="zh-CN",
+            )
+
+            # 注入 Cookie
+            if WECHAT_COOKIE:
+                cookies = []
+                for item in WECHAT_COOKIE.split("; "):
+                    if "=" in item:
+                        key, val = item.split("=", 1)
+                        cookies.append({
+                            "name": key,
+                            "value": val,
+                            "domain": ".qq.com",
+                            "path": "/",
+                        })
+                context.add_cookies(cookies)
+
+            page = context.new_page()
+
+            # 屏蔽图片/字体等无关资源，加速加载
+            page.route(
+                re.compile(r"\.(png|jpg|jpeg|gif|svg|woff2?|ttf|css)(\?.*)?$"),
+                lambda route: route.abort(),
+            )
+
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # 等待正文渲染
+            try:
+                page.wait_for_selector("#js_content", timeout=15000)
+            except Exception:
+                pass
+
+            # 额外等待 JS 异步加载阅读量
+            time.sleep(3)
+
+            html = page.content()
+            browser.close()
+            return html
+
+    except Exception as e:
+        log.warning(f"Playwright 渲染失败，回退到 requests: {e}")
+        return None
+
+
+def _fetch_html_requests(url: str) -> str | None:
+    """用 requests 获取静态 HTML"""
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": USER_AGENT,
         "Referer": "https://mp.weixin.qq.com/",
         "Accept-Language": "zh-CN,zh;q=0.9",
     }
@@ -124,14 +190,20 @@ def fetch_article(url: str) -> dict:
         headers["Cookie"] = WECHAT_COOKIE
 
     resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-
-    # 检查状态码
     if resp.status_code == 404:
-        return {"_error": "链接失效", "_status": "链接失效"}
+        return None
     if resp.status_code != 200:
-        return {"_error": f"HTTP {resp.status_code}", "_status": "采集失败"}
+        return None
+    return resp.text
 
-    html = resp.text
+
+def fetch_article(url: str) -> dict:
+    """采集单篇文章，优先用 Playwright 渲染获取阅读量/在看数"""
+    # 1. 优先 Playwright（能拿到阅读量/在看数）
+    html = _get_rendered_html(url) or _fetch_html_requests(url)
+
+    if html is None:
+        return {"_error": "HTTP 404", "_status": "链接失效"}
 
     # 检查是否被反爬拦截
     if "请输入验证码" in html or "环境异常" in html or "当前访问疑似黑客" in html:
@@ -160,15 +232,12 @@ def fetch_article(url: str) -> dict:
     # --- 正文 ---
     content_el = soup.find(id="js_content")
     if content_el:
-        # 移除 hidden 干扰字符
         for tag in content_el.find_all(style=re.compile(r"visibility\s*:\s*hidden")):
             tag.decompose()
-        # 移除 script / style
         for tag in content_el.find_all(["script", "style"]):
             tag.decompose()
 
         full_text = content_el.get_text(separator="\n")
-        # 清理多余空行
         full_text = re.sub(r"\n{3,}", "\n\n", full_text).strip()
         result["正文内容"] = full_text
         result["正文摘要"] = full_text[:200] if len(full_text) > 200 else full_text
@@ -176,71 +245,84 @@ def fetch_article(url: str) -> dict:
         result["正文内容"] = ""
         result["正文摘要"] = ""
 
-    # --- 阅读量 ---
+    # --- 阅读量 & 在看数（渲染后 HTML 中查找）---
     result["阅读量"] = _extract_read_count(soup)
-
-    # --- 在看数 ---
     result["在看数"] = _extract_like_count(soup)
 
     return result
 
 
 def _extract_read_count(soup: BeautifulSoup) -> str:
-    """尽力从 HTML 中提取阅读量（静态 HTML 中通常没有，需浏览器渲染）"""
-    # 方法1：id 为 read_num
-    for el_id in ["read_num", "readNum"]:
-        el = soup.find(id=el_id)
-        if el:
-            text = el.get_text(strip=True)
-            if text:
-                return _parse_number(text)
+    """从渲染后的 HTML 中提取阅读量"""
+    # 阅读量常用的 DOM 特征
+    selectors = [
+        # 直接 id
+        lambda s: s.find(id="read_num"),
+        lambda s: s.find(id="readNum"),
+        # class 包含 read_num
+        lambda s: s.find(class_=re.compile(r"read_num", re.I)),
+        # span 文本含"阅读"
+        lambda s: s.find("span", string=re.compile(r"阅读\s*\d")),
+        # 底部 meta 区域
+        lambda s: s.find(class_=re.compile(r"rich_media_meta_text", re.I), string=re.compile(r"阅读")),
+    ]
+    for selector in selectors:
+        try:
+            el = selector(soup)
+            if el:
+                text = el.get_text(strip=True)
+                num = _parse_number(text)
+                if num:
+                    return num
+        except Exception:
+            continue
 
-    # 方法2：class 含 read
-    for cls in ["read_num", "readNum", "rich_media_meta_text"]:
-        for el in soup.find_all(class_=re.compile(cls, re.I)):
-            text = el.get_text(strip=True)
-            num = _parse_number(text)
-            if num:
-                return num
-
-    # 方法3：script 中的数据
+    # script 中的 JSON 数据
     for script in soup.find_all("script"):
-        if script.string and "read_num" in script.string:
-            match = re.search(r'"read_num"\s*:\s*(\d+)', script.string)
-            if match:
-                return match.group(1)
+        if script.string:
+            for key in ["read_num", "readNum", "read_count", "readCount"]:
+                match = re.search(rf'"{key}"\s*:\s*(\d+)', script.string)
+                if match:
+                    return match.group(1)
 
     return ""
 
 
 def _extract_like_count(soup: BeautifulSoup) -> str:
-    """尽力从 HTML 中提取在看数"""
-    for cls in ["likeNum", "like_num"]:
-        el = soup.find(class_=re.compile(cls, re.I))
-        if el:
-            text = el.get_text(strip=True)
-            num = _parse_number(text)
-            if num:
-                return num
+    """从渲染后的 HTML 中提取在看数"""
+    selectors = [
+        lambda s: s.find(class_=re.compile(r"like_num|likeNum", re.I)),
+        lambda s: s.find("span", string=re.compile(r"在看\s*\d")),
+        lambda s: s.find(class_=re.compile(r"rich_media_meta_text", re.I), string=re.compile(r"在看")),
+    ]
+    for selector in selectors:
+        try:
+            el = selector(soup)
+            if el:
+                text = el.get_text(strip=True)
+                num = _parse_number(text)
+                if num:
+                    return num
+        except Exception:
+            continue
 
     for script in soup.find_all("script"):
-        if script.string and "like_num" in script.string:
-            match = re.search(r'"like_num"\s*:\s*(\d+)', script.string)
-            if match:
-                return match.group(1)
+        if script.string:
+            for key in ["like_num", "likeNum", "like_count", "likeCount"]:
+                match = re.search(rf'"{key}"\s*:\s*(\d+)', script.string)
+                if match:
+                    return match.group(1)
 
     return ""
 
 
 def _parse_number(text: str) -> str:
     """从文本中提取数字，如 '阅读 1.2万' → '12000'"""
-    # 直接提取数字部分
     match = re.search(r"[\d,\.]+", text)
     if not match:
         return ""
     num_str = match.group().replace(",", "")
 
-    # 处理"万"单位
     if "万" in text:
         try:
             return str(int(float(num_str) * 10000))
@@ -331,7 +413,6 @@ def main():
             "采集时间": now,
         }
 
-        # 只把非空的字段写入
         for key in ["标题", "发布时间", "正文内容", "正文摘要", "阅读量", "在看数"]:
             if data.get(key):
                 update_fields[key] = data[key]
@@ -340,7 +421,12 @@ def main():
             success += 1
             title_preview = (data.get("标题") or "")[:30]
             read = data.get("阅读量", "")
-            log.info(f"  ✓ {title_preview}  {read if read else ''}")
+            like = data.get("在看数", "")
+            extras = ", ".join(filter(None, [
+                f"阅读 {read}" if read else "",
+                f"在看 {like}" if like else "",
+            ]))
+            log.info(f"  ✓ {title_preview}  {extras}")
         else:
             fail += 1
 
