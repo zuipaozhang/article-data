@@ -83,7 +83,7 @@ def filter_pending(records: list[dict]) -> list[dict]:
     """筛选「待采集」的记录：采集状态为空 或 等于"待采集" """
     pending = []
     for r in records:
-        status = r.get("fields", {}).get("采集状态", "").strip()
+        status = r.get("fields", {}).get("采集状态") or ""
         if not status or status == "待采集":
             pending.append(r)
     return pending
