@@ -279,7 +279,7 @@ def main():
     for i, record in enumerate(pending):
         record_id = record.get("record_id", "")
         fields = record.get("fields", {})
-        url = fields.get("原文链接", "").strip()
+        url = (fields.get("原文链接") or "").strip()
         name = fields.get("公众号名称", "")
 
         log.info(f"[{i + 1}/{len(pending)}] {name} | {url[:60]}...")
