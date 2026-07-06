@@ -272,6 +272,13 @@ def main():
         log.info("没有需要采集的记录，退出")
         return
 
+    # DEBUG: 打印第一条待采集记录的原始数据
+    sample = pending[0]
+    log.info(f"[DEBUG] 第一条记录的 record_id: {sample.get('record_id')}")
+    log.info(f"[DEBUG] 第一条记录的 fields keys: {list(sample.get('fields', {}).keys())}")
+    for k, v in sample.get("fields", {}).items():
+        log.info(f"[DEBUG]   {k} = {repr(v)}")
+
     # 3. 逐条采集
     success = 0
     fail = 0
