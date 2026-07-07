@@ -5,6 +5,7 @@
 GitHub Actions 定时运行，每周五 15:00 (北京时间)
 """
 
+import json
 import os
 import re
 import time
@@ -116,10 +117,61 @@ USER_AGENT = (
 )
 
 
-def _get_rendered_html(url: str) -> tuple[str | None, dict]:
-    """用 Playwright 渲染页面。同时拦截 getappmsgext API 获取阅读量/在看数。
+def _extract_mp_params(html: str, url: str) -> dict:
+    """从文章 HTML 中提取调用 getappmsgext 所需的参数"""
+    params = {}
 
-    返回 (html, stats) 其中 stats 直接包含 read_num / like_num
+    # 从 URL 中提取 __biz, mid, sn, idx
+    qs_match = re.search(r"[?&]__biz=([^&#]+)", url)
+    if qs_match:
+        params["__biz"] = qs_match.group(1)
+
+    # 从 HTML 中提取
+    for key, pattern in [
+        ("mid", r'var\s+mid\s*=\s*"(\d+)"'),
+        ("idx", r'var\s+idx\s*=\s*"(\d+)"'),
+        ("sn", r'var\s+sn\s*=\s*"([^"]+)"'),
+        # 公众号唯一标识
+        ("fakeid", r'var\s+fakeid\s*=\s*"([^"]+)"'),
+    ]:
+        match = re.search(pattern, html)
+        if match:
+            params[key] = match.group(1)
+
+    # 如果 URL 里没有 __biz，从 HTML var 中提取
+    if not params.get("__biz"):
+        match = re.search(r'var\s+__biz\s*=\s*"([^"]+)"', html)
+        if match:
+            params["__biz"] = match.group(1)
+
+    # 提取 appmsg_token（从页面 script 或 cookie 中）
+    match = re.search(r'window\.appmsg_token\s*=\s*"([^"]+)"', html)
+    if match:
+        params["appmsg_token"] = match.group(1)
+    else:
+        match = re.search(r'appmsg_token\s*[=:]\s*"([^"]+)"', html)
+        if match:
+            params["appmsg_token"] = match.group(1)
+
+    # pass_ticket
+    match = re.search(r'pass_ticket\s*[=:]\s*"([^"]+)"', html)
+    if match:
+        params["pass_ticket"] = match.group(1)
+
+    # 从 URL 的 query string 中补充
+    for key in ["mid", "idx", "sn"]:
+        if not params.get(key):
+            match = re.search(rf"[?&]{key}=([^&#]+)", url)
+            if match:
+                params[key] = match.group(1)
+
+    return params
+
+
+def _get_rendered_html(url: str) -> tuple[str | None, dict]:
+    """用 Playwright 渲染页面，同时主动调用 getappmsgext 获取阅读量/在看数。
+
+    返回 (html, stats) 其中 stats 包含 read_num / like_num
     """
     stats: dict = {}
 
@@ -130,6 +182,17 @@ def _get_rendered_html(url: str) -> tuple[str | None, dict]:
         return None, {}
 
     try:
+        # 先快速获取 HTML，提取参数
+        log.info("  获取页面参数...")
+        resp = requests.get(url, headers={
+            "User-Agent": USER_AGENT,
+            "Referer": "https://mp.weixin.qq.com/",
+        }, timeout=15)
+        mp_params = _extract_mp_params(resp.text, url)
+        log.info(f"  提取到的参数: __biz={mp_params.get('__biz','?')}, "
+                 f"mid={mp_params.get('mid','?')}, "
+                 f"idx={mp_params.get('idx','?')}")
+
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=[
                 "--no-sandbox",
@@ -142,7 +205,7 @@ def _get_rendered_html(url: str) -> tuple[str | None, dict]:
                 locale="zh-CN",
             )
 
-            # 注入 Cookie（修正 domain 为 mp.weixin.qq.com）
+            # 注入 Cookie
             if WECHAT_COOKIE:
                 cookies = []
                 for item in WECHAT_COOKIE.split("; "):
@@ -158,27 +221,27 @@ def _get_rendered_html(url: str) -> tuple[str | None, dict]:
 
             page = context.new_page()
 
-            # 拦截 getappmsgext —— 微信文章数据 API
+            # 拦截所有 XHR 响应，捕获 getappmsgext
+            captured_stats = {}
+
             def _on_response(response):
-                if "getappmsgext" in response.url:
+                url_lower = response.url.lower()
+                if "getappmsgext" in url_lower or "appmsg" in url_lower:
                     try:
                         body = response.json()
-                        stat = body.get("appmsgstat", {})
-                        if "read_num" in stat:
-                            stats["read_num"] = stat["read_num"]
-                            log.info(f"  [API] 阅读量={stat['read_num']}")
-                        if "like_num" in stat:
-                            stats["like_num"] = stat["like_num"]
-                            log.info(f"  [API] 在看数={stat['like_num']}")
-                        # 旧接口返回格式
-                        if "old_like_num" in stat:
-                            stats.setdefault("like_num", stat["old_like_num"])
+                        log.info(f"  [NET] 拦截到: {response.url[:80]}...")
+                        for key in ["appmsgstat", "data"]:
+                            container = body.get(key, {})
+                            for field in ["read_num", "like_num", "old_like_num",
+                                          "read_count", "like_count"]:
+                                if field in container and container[field] is not None:
+                                    captured_stats[field] = container[field]
                     except Exception:
                         pass
 
             page.on("response", _on_response)
 
-            # 屏蔽图片/字体等无关资源，加速加载
+            # 屏蔽无关资源
             page.route(
                 re.compile(r"\.(png|jpg|jpeg|gif|svg|woff2?|ttf|css)(\?.*)?$"),
                 lambda route: route.abort(),
@@ -186,37 +249,73 @@ def _get_rendered_html(url: str) -> tuple[str | None, dict]:
 
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # 等待正文渲染
+            # 等待 JS 执行完毕
             try:
                 page.wait_for_selector("#js_content", timeout=15000)
             except Exception:
                 pass
 
-            # 等待异步 API 返回（阅读量接口通常 1-3 秒返回）
-            time.sleep(4)
+            time.sleep(2)
+
+            # 如果还没拦截到，主动用 page.evaluate 调 API
+            if not captured_stats and mp_params.get("__biz") and mp_params.get("mid"):
+                log.info("  未拦截到 API，主动调用...")
+                try:
+                    result = page.evaluate("""
+                        async ([baseUrl, params]) => {
+                            const qs = new URLSearchParams({
+                                __biz: params.__biz || '',
+                                mid: params.mid || '',
+                                sn: params.sn || '',
+                                idx: params.idx || '1',
+                                key: '',
+                                pass_ticket: params.pass_ticket || '',
+                                appmsg_token: params.appmsg_token || '',
+                                f: 'json',
+                            });
+                            const url = '/mp/getappmsgext?' + qs.toString();
+                            try {
+                                const resp = await fetch(url, { credentials: 'include' });
+                                const data = await resp.json();
+                                return JSON.stringify(data);
+                            } catch(e) {
+                                return 'fetch error: ' + e.message;
+                            }
+                        }
+                    """, [url, mp_params])
+                    log.info(f"  主动调用结果: {result[:300]}")
+                    try:
+                        body = json.loads(result) if isinstance(result, str) else result
+                        for container_key in ["appmsgstat", "data"]:
+                            container = body.get(container_key, {})
+                            for field in ["read_num", "like_num", "old_like_num",
+                                          "read_count", "like_count"]:
+                                val = container.get(field)
+                                if val is not None:
+                                    captured_stats[field] = val
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.warning(f"  主动调用失败: {e}")
+
+            time.sleep(2)
 
             html = page.content()
-
-            # 没拦截到 API，debug 一下页面底部
-            if not stats:
-                try:
-                    debug_text = page.evaluate("""() => {
-                        const el = document.getElementById('js_content');
-                        if (!el) return 'no js_content';
-                        let next = el.nextElementSibling;
-                        let text = '';
-                        for (let i = 0; i < 5 && next; i++) {
-                            text += (next.className || next.tagName) + ': ' +
-                                    (next.textContent || '').substring(0, 200) + '\\n';
-                            next = next.nextElementSibling;
-                        }
-                        return text || 'no siblings after js_content';
-                    }""")
-                    log.info(f"  [DEBUG] js_content 后续节点: {debug_text[:500]}")
-                except Exception as e:
-                    log.info(f"  [DEBUG] evaluate 失败: {e}")
-
             browser.close()
+
+            # 整理 stats
+            read = captured_stats.get("read_num") or captured_stats.get("read_count")
+            like = captured_stats.get("like_num") or captured_stats.get("old_like_num") or captured_stats.get("like_count")
+            if read:
+                stats["read_num"] = read
+                log.info(f"  [OK] 阅读量={read}")
+            if like:
+                stats["like_num"] = like
+                log.info(f"  [OK] 在看数={like}")
+
+            if not stats:
+                log.warning("  未能获取阅读量/在看数")
+
             return html, stats
 
     except Exception as e:
