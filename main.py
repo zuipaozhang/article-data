@@ -116,13 +116,18 @@ USER_AGENT = (
 )
 
 
-def _get_rendered_html(url: str) -> str | None:
-    """用 Playwright 渲染页面，拿到包含阅读量/在看数的完整 HTML"""
+def _get_rendered_html(url: str) -> tuple[str | None, dict]:
+    """用 Playwright 渲染页面。同时拦截 getappmsgext API 获取阅读量/在看数。
+
+    返回 (html, stats) 其中 stats 直接包含 read_num / like_num
+    """
+    stats: dict = {}
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         log.warning("Playwright 未安装，回退到 requests 模式")
-        return None
+        return None, {}
 
     try:
         with sync_playwright() as p:
@@ -137,7 +142,7 @@ def _get_rendered_html(url: str) -> str | None:
                 locale="zh-CN",
             )
 
-            # 注入 Cookie
+            # 注入 Cookie（修正 domain 为 mp.weixin.qq.com）
             if WECHAT_COOKIE:
                 cookies = []
                 for item in WECHAT_COOKIE.split("; "):
@@ -146,12 +151,32 @@ def _get_rendered_html(url: str) -> str | None:
                         cookies.append({
                             "name": key,
                             "value": val,
-                            "domain": ".qq.com",
+                            "domain": "mp.weixin.qq.com",
                             "path": "/",
                         })
                 context.add_cookies(cookies)
 
             page = context.new_page()
+
+            # 拦截 getappmsgext —— 微信文章数据 API
+            def _on_response(response):
+                if "getappmsgext" in response.url:
+                    try:
+                        body = response.json()
+                        stat = body.get("appmsgstat", {})
+                        if "read_num" in stat:
+                            stats["read_num"] = stat["read_num"]
+                            log.info(f"  [API] 阅读量={stat['read_num']}")
+                        if "like_num" in stat:
+                            stats["like_num"] = stat["like_num"]
+                            log.info(f"  [API] 在看数={stat['like_num']}")
+                        # 旧接口返回格式
+                        if "old_like_num" in stat:
+                            stats.setdefault("like_num", stat["old_like_num"])
+                    except Exception:
+                        pass
+
+            page.on("response", _on_response)
 
             # 屏蔽图片/字体等无关资源，加速加载
             page.route(
@@ -167,19 +192,39 @@ def _get_rendered_html(url: str) -> str | None:
             except Exception:
                 pass
 
-            # 额外等待 JS 异步加载阅读量
-            time.sleep(3)
+            # 等待异步 API 返回（阅读量接口通常 1-3 秒返回）
+            time.sleep(4)
 
             html = page.content()
+
+            # 没拦截到 API，debug 一下页面底部
+            if not stats:
+                try:
+                    debug_text = page.evaluate("""() => {
+                        const el = document.getElementById('js_content');
+                        if (!el) return 'no js_content';
+                        let next = el.nextElementSibling;
+                        let text = '';
+                        for (let i = 0; i < 5 && next; i++) {
+                            text += (next.className || next.tagName) + ': ' +
+                                    (next.textContent || '').substring(0, 200) + '\\n';
+                            next = next.nextElementSibling;
+                        }
+                        return text || 'no siblings after js_content';
+                    }""")
+                    log.info(f"  [DEBUG] js_content 后续节点: {debug_text[:500]}")
+                except Exception as e:
+                    log.info(f"  [DEBUG] evaluate 失败: {e}")
+
             browser.close()
-            return html
+            return html, stats
 
     except Exception as e:
         log.warning(f"Playwright 渲染失败，回退到 requests: {e}")
-        return None
+        return None, {}
 
 
-def _fetch_html_requests(url: str) -> str | None:
+def _fetch_html_requests(url: str) -> tuple[str | None, dict]:
     """用 requests 获取静态 HTML"""
     headers = {
         "User-Agent": USER_AGENT,
@@ -191,16 +236,18 @@ def _fetch_html_requests(url: str) -> str | None:
 
     resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
     if resp.status_code == 404:
-        return None
+        return None, {}
     if resp.status_code != 200:
-        return None
-    return resp.text
+        return None, {}
+    return resp.text, {}
 
 
 def fetch_article(url: str) -> dict:
     """采集单篇文章，优先用 Playwright 渲染获取阅读量/在看数"""
     # 1. 优先 Playwright（能拿到阅读量/在看数）
-    html = _get_rendered_html(url) or _fetch_html_requests(url)
+    html, api_stats = _get_rendered_html(url)
+    if html is None:
+        html, _ = _fetch_html_requests(url)
 
     if html is None:
         return {"_error": "HTTP 404", "_status": "链接失效"}
@@ -245,9 +292,17 @@ def fetch_article(url: str) -> dict:
         result["正文内容"] = ""
         result["正文摘要"] = ""
 
-    # --- 阅读量 & 在看数（渲染后 HTML 中查找）---
-    result["阅读量"] = _extract_read_count(soup)
-    result["在看数"] = _extract_like_count(soup)
+    # --- 阅读量 & 在看数（优先 API 拦截，次选 HTML 解析）---
+    result["阅读量"] = (
+        str(api_stats.get("read_num", ""))
+        if api_stats.get("read_num")
+        else _extract_read_count(soup)
+    )
+    result["在看数"] = (
+        str(api_stats.get("like_num", ""))
+        if api_stats.get("like_num")
+        else _extract_like_count(soup)
+    )
 
     return result
 
